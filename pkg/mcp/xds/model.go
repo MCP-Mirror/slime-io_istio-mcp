@@ -43,9 +43,12 @@ func (l *StringList) UnmarshalJSON(data []byte) error {
 
 // Resources is an alias for array of marshaled resources.
 type Resources struct {
-	Data    []*anypb.Any
+	Data    []*discovery.Resource
 	Version string
 }
+
+// DeletedResources is an alias for array of strings that represent removed resources in delta.
+type DeletedResources = []string
 
 // XdsUpdates include information about the subset of updated resources.
 // See for example EDS incremental updates.
@@ -59,6 +62,13 @@ type XdsResourceGenerator interface {
 	Generate(proxy *Proxy, push *PushContext, w *WatchedResource, updates XdsUpdates) Resources
 }
 
+// XdsDeltaResourceGenerator generates Sotw and delta resources.
+type XdsDeltaResourceGenerator interface {
+	XdsResourceGenerator
+	// GenerateDeltas returns the changed and removed resources, along with whether or not delta was actually used.
+	GenerateDeltas(proxy *Proxy, push *PushContext, w *WatchedResource, updates XdsUpdates) (Resources, DeletedResources)
+}
+
 // WatchedResource tracks an active DiscoveryRequest subscription.
 type WatchedResource struct {
 	// TypeUrl is copied from the DiscoveryRequest.TypeUrl that initiated watching this resource.
@@ -70,6 +80,10 @@ type WatchedResource struct {
 	// For endpoints the resource names will have list of clusters and for clusters it is empty.
 	ResourceNames []string
 	resourceSent  map[uint32]struct{}
+
+	// Wildcard indicates the subscription is a wildcard subscription. This only applies to types that
+	// allow both wildcard and non-wildcard subscriptions.
+	Wildcard bool
 
 	// VersionSent is the version of the resource included in the last sent response.
 	// It corresponds to the [Cluster/Route/Listener]VersionSent in the XDS package.
@@ -94,9 +108,6 @@ type WatchedResource struct {
 
 	// Updates count the number of generated updates for the resource
 	Updates int
-
-	// LastSize tracks the size of the last update
-	LastSize int
 
 	// Last request contains the last DiscoveryRequest received for
 	// this type. Generators are called immediately after each request,
@@ -141,6 +152,10 @@ func (w *WatchedResource) RecordNonceSent(nonceSent string) {
 
 func (w *WatchedResource) RecordResourceSent(key model.ConfigKey) {
 	w.resourceSent[key.HashCode()] = struct{}{}
+}
+
+func (w *WatchedResource) RemoveResourceSent(key model.ConfigKey) {
+	delete(w.resourceSent, key.HashCode())
 }
 
 func (w *WatchedResource) IsResourceSent(key model.ConfigKey) bool {
@@ -472,6 +487,7 @@ func isValidIPAddress(ip string) bool {
 // The struct is exposed in a debug endpoint - fields public to allow
 // easy serialization as json.
 type PushContext struct {
+	// Version is the newest version of the config that was stored in the ConfigStore.
 	Version string
 
 	// Config interface for listing routing rules

@@ -36,8 +36,9 @@ var (
 	version = "0"
 )
 
-func nonce(noncePrefix string) string {
-	return noncePrefix + uuid.New().String()
+// nonce appends a uuid to the version to avid duplicate nonces.
+func nonce(versionPrefix string) string {
+	return versionPrefix + uuid.New().String()
 }
 
 // DiscoveryStream is an interface for ADS.
@@ -45,6 +46,14 @@ type DiscoveryStream interface {
 	Send(*discovery.DiscoveryResponse) error
 	Recv() (*discovery.DiscoveryRequest, error)
 	grpc.ServerStream
+}
+
+// ResourceDelta records the difference in requested resources by an XDS client
+type ResourceDelta struct {
+	// Subscribed indicates the client requested these additional resources
+	Subscribed map[string]struct{}
+	// Unsubscribed indicates the client no longer requires these resources
+	Unsubscribed map[string]struct{}
 }
 
 // Event represents a config or registry event that results in a push.
@@ -56,6 +65,10 @@ type Event struct {
 
 	// function to call once a push is finished. This must be called or future changes may be blocked.
 	done func()
+
+	// Delta defines the resources that were added or removed as part of this push request.
+	// This is set only on requests from the client which change the set of resources they (un)subscribe from.
+	Delta ResourceDelta
 }
 
 // Connection holds information about connected client.
@@ -119,21 +132,27 @@ func (conn *Connection) Notify(ev *Event) bool {
 
 // Send with timeout
 func (conn *Connection) send(res *discovery.DiscoveryResponse) error {
+	return conn.sendResponse(res.TypeUrl, res.VersionInfo, res.Nonce, func() error {
+		return conn.stream.Send(res)
+	})
+}
+
+// Send with timeout
+func (conn *Connection) sendResponse(typeurl, versoin, nonce string, send func() error) error {
 	done := make(chan error, 1)
 	// hardcoded for now - not sure if we need a setting
 	t := time.NewTimer(SendTimeout)
 	go func() {
-		err := conn.stream.Send(res)
-		stype := GetShortType(res.TypeUrl)
+		err := send()
 		conn.mu.Lock()
-		if res.Nonce != "" {
-			w := conn.node.Active[stype]
+		if nonce != "" {
+			w := conn.node.Active[typeurl]
 			if w == nil {
-				w = NewWatchedResource(res.TypeUrl)
-				conn.node.Active[stype] = w
+				w = NewWatchedResource(typeurl)
+				conn.node.Active[typeurl] = w
 			}
-			w.RecordNonceSent(res.Nonce)
-			w.VersionSent = res.VersionInfo
+			w.RecordNonceSent(nonce)
+			w.VersionSent = versoin
 		}
 		conn.mu.Unlock()
 		done <- err
@@ -294,17 +313,6 @@ func (s *Server) StreamAggregatedResources(stream discovery.AggregatedDiscoveryS
 	if peerInfo, ok := peer.FromContext(ctx); ok {
 		peerAddr = peerInfo.Addr.String()
 	}
-
-	// TODO auth left to impl.
-	//ids, err := s.authenticate(ctx)
-	//if err != nil {
-	//	return err
-	//}
-	//if ids != nil {
-	//	xdsLog.Debugf("Authenticated XDS: %v with identity %v", peerAddr, ids)
-	//} else {
-	//	xdsLog.Debuga("Unauthenticated XDS: ", peerAddr)
-	//}
 
 	con := newConnection(peerAddr, stream)
 
@@ -503,18 +511,15 @@ func (s *Server) pushConnection(con *Connection, pushEv *Event) error {
 
 	xdsLog.Infof("Pushing %v", con.ConID)
 
-	// check version, suppress if changed.
-	currentVersion := versionInfo()
-
 	// When using Generator, the generic WatchedResource is used instead of the individual
 	// 'LDSWatch', etc.
 	// Each Generator is responsible for determining if the push event requires a push -
 	// returning nil if the push is not needed.
 	if con.node.XdsResourceGenerator != nil {
 		for _, w := range con.node.Active {
-			err := s.pushGeneratorV2(con, pushEv.push, currentVersion, w, pushEv.configsUpdated)
+			err := s.pushGeneratorV2(con, pushEv.push, w, pushEv.configsUpdated)
 			if err != nil {
-				return fmt.Errorf("pushGeneratorV2 typeurl %s version %s mer err %v", w.TypeUrl, currentVersion, err)
+				return fmt.Errorf("pushGeneratorV2 typeurl %s mer err %v", w.TypeUrl, err)
 			}
 		}
 	}

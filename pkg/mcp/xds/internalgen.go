@@ -81,6 +81,11 @@ func (sg *InternalGen) OnNack(node *Proxy, dr *discovery.DiscoveryRequest) {
 	sg.startPush(TypeURLNACK, []proto.Message{dr})
 }
 
+func (sg *InternalGen) OnDeltaNack(node *Proxy, dr *discovery.DeltaDiscoveryRequest) {
+	dr.Node.Id = node.ID
+	sg.startPush(TypeURLNACK, []proto.Message{dr})
+}
+
 // PushAll will immediately send a response to all connections that
 // are watching for the specific type.
 // TODO: additional filters can be added, for example namespace.

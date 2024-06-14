@@ -137,6 +137,8 @@ func SerializeConfigMeta(cm Meta) []byte {
 	return buf.Bytes()
 }
 
+// NOTE:
+// we require the ResourceVersion of the Config can simply be compared with `>`, and the newer the version the larger.
 type Config = config.Config
 type Meta = config.Meta
 
@@ -232,9 +234,9 @@ func updayeConfigAnnoOrLabel(mp *map[string]string, k, v string) bool {
 	return true
 }
 
+// UpdateAnnotationResourceVersion check if c.ResourceVersion has changed (different from ver in anno)
+// update version in annotation if that
 func UpdateAnnotationResourceVersion(c *Config) string {
-	// check if c.ResourceVersion has changed (different from ver in anno)
-	// update version in annotation if that
 	annos := c.Annotations
 	var prev string
 	if annos == nil {
@@ -260,6 +262,7 @@ func UpdateAnnotationResourceVersion(c *Config) string {
 	return prev
 }
 
+// FilterByGvkAndNamespace returns a subset of configs that match the given gvk and namespace and have newer version than the given version.
 func FilterByGvkAndNamespace(configs []Config, gvk resource.GroupVersionKind, namespace, ver string) []Config {
 	var (
 		allGvk = gvk == resource.AllGvk
@@ -285,6 +288,8 @@ func FilterByGvkAndNamespace(configs []Config, gvk resource.GroupVersionKind, na
 
 type ConfigStore interface {
 	Get(gvk resource.GroupVersionKind, namespace, name string) (*Config, error)
+	// List returns all configs that match the given gvk and namespace and have newer version than the given version.
+	// and return the newest version.
 	List(gvk resource.GroupVersionKind, namespace, ver string) ([]Config, string, error)
 	// Snapshot if pass all-namespace, will return a snapshot contains all ns's data and use the largest
 	// version of them as version.
@@ -295,17 +300,21 @@ type ConfigStore interface {
 	// version can not be empty or return nil.
 	// Ns can be empty to indicate merging-all-contents-of-same-version-to-one-snapshot.
 	VersionSnapshot(version, ns string) ConfigSnapshot
+	// VersionByGvk returns the largest version of all configs that match the given gvk.
+	VersionByGvk(gvk resource.GroupVersionKind) string
 }
 
 // ConfigSnapshot may merge configs of different namespaces but same version into a single snapshot.
 type ConfigSnapshot interface {
 	Version() string
+	VersionByGvk(gvk resource.GroupVersionKind) string
 	Config(gvk resource.GroupVersionKind, namespace, name string) *Config
 	Configs(gvk resource.GroupVersionKind, namespace, ver string) []Config
 	Empty() bool
 }
 
 type NsConfigSnapshot struct {
+	// snapshots is a map of namespace to snapshot.
 	snapshots map[string]ConfigSnapshot
 }
 
@@ -328,11 +337,25 @@ func (n NsConfigSnapshot) Version() string {
 			continue
 		}
 		ver := snapshot.Version()
-		if strings.Compare(ver, ret) > 0 {
+		if ret == "" || ver > ret {
 			ret = ver
 		}
 	}
 
+	return ret
+}
+
+func (n NsConfigSnapshot) VersionByGvk(gvk resource.GroupVersionKind) string {
+	var ret string
+	for _, snapshot := range n.snapshots {
+		if snapshot == nil {
+			continue
+		}
+		ver := snapshot.VersionByGvk(gvk)
+		if ret == "" || ver > ret {
+			ret = ver
+		}
+	}
 	return ret
 }
 
@@ -378,12 +401,23 @@ func (n NsConfigSnapshot) Empty() bool {
 }
 
 type SimpleConfigSnapshot struct {
-	version string
-	configs []Config
+	version      string
+	versionByGvk map[resource.GroupVersionKind]string
+	configs      []Config
 }
 
-func MakeSimpleConfigSnapshot(version string, configs []Config) SimpleConfigSnapshot {
-	return SimpleConfigSnapshot{version, configs}
+func MakeSimpleConfigSnapshot(configs []Config) SimpleConfigSnapshot {
+	ret := SimpleConfigSnapshot{
+		configs:      configs,
+		versionByGvk: map[resource.GroupVersionKind]string{},
+	}
+	for _, cfg := range configs {
+		ret.versionByGvk[cfg.GroupVersionKind] = cfg.ResourceVersion
+		if ret.version == "" || cfg.ResourceVersion > ret.version {
+			ret.version = cfg.ResourceVersion
+		}
+	}
+	return ret
 }
 
 func (s SimpleConfigSnapshot) Empty() bool {
@@ -392,6 +426,10 @@ func (s SimpleConfigSnapshot) Empty() bool {
 
 func (s SimpleConfigSnapshot) Version() string {
 	return s.version
+}
+
+func (s SimpleConfigSnapshot) VersionByGvk(gvk resource.GroupVersionKind) string {
+	return s.versionByGvk[gvk]
 }
 
 // Config not that efficient
@@ -454,6 +492,19 @@ func (s *SimpleConfigStore) Version(ns string) string {
 		}
 	}
 
+	return ret
+}
+
+func (s *SimpleConfigStore) VersionByGvk(gvk resource.GroupVersionKind) string {
+	s.RLock()
+	defer s.RUnlock()
+	ret := VersionNotInitialized
+	for _, snap := range s.snaps {
+		ver := snap.VersionByGvk(gvk)
+		if strings.Compare(ver, ret) > 0 {
+			ret = ver
+		}
+	}
 	return ret
 }
 

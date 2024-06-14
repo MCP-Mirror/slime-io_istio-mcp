@@ -8,8 +8,8 @@ import (
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/grpc/codes"
 
-	istioversion "istio.io/libistio/pkg/version"
 	"istio.io/libistio/pkg/env"
+	istioversion "istio.io/libistio/pkg/version"
 )
 
 var controlPlane *corev3.ControlPlane
@@ -18,7 +18,7 @@ func init() {
 	// The Pod Name (instance identity) is in PilotArgs, but not reachable globally nor from DiscoveryServer
 	podName := env.RegisterStringVar("POD_NAME", "", "").Get()
 	byVersion, err := json.Marshal(IstioControlPlaneInstance{
-		Component: "istiod",
+		Component: "slime-mcp-server",
 		ID:        podName,
 		Info:      istioversion.Info,
 	})
@@ -110,80 +110,38 @@ func (s *Server) handleCustomGenerator(con *Connection, req *discovery.Discovery
 		return nil
 	}
 
-	push := s.globalPushContext()
-	resp := &discovery.DiscoveryResponse{
-		ControlPlane: ControlPlane(),
-		TypeUrl:      w.TypeUrl,
-		VersionInfo:  push.Version, // TODO: we can now generate per-type version !
-		Nonce:        nonce(push.Version),
-	}
-	if push.Version == "" { // Usually in tests.
-		resp.VersionInfo = resp.Nonce
-	}
-
 	// XdsResourceGenerator is the default generator for this connection. We want to allow
 	// some types to use custom generators - for example EDS.
-	g := con.node.XdsResourceGenerator
-	if cg, f := s.Generators[con.node.Metadata.Generator+"/"+w.TypeUrl]; f {
-		g = cg
-	}
-	if cg, f := s.Generators[w.TypeUrl]; f {
-		g = cg
-	}
-	if g == nil {
-		g = s.Generators["api"] // default to MCS generators - any type supported by store
-	}
-
+	g := s.findGenerator(w.TypeUrl, con.node)
 	if g == nil {
 		return nil
 	}
 
-	genRes := g.Generate(con.node, push, w, nil)
-	sz := 0
-	for _, rc := range genRes.Data {
-		resp.Resources = append(resp.Resources, rc)
-		sz += len(rc.Value)
-	}
-	if s.o.IncPush {
-		resp.Nonce = genRes.Version
-	}
-
-	err := con.send(resp)
-	if err != nil {
-		return err
-	}
-	w.LastSent = time.Now()
-	w.LastSize = sz // just resource size - doesn't include header and types
-	w.RecordNonceSent(resp.Nonce)
-
-	xdsLog.Infof("Pushed %s to %s count=%d size=%d nonce=%s", w.TypeUrl, con.ConID, len(genRes.Data), sz, resp.Nonce)
-
-	return nil
+	push := s.globalPushContext()
+	return s.pushXds(g, con, push, w, nil)
 }
 
 // Called for config updates.
 // Will not be called if ProxyNeedsPush returns false - ie. if the update
-func (s *Server) pushGeneratorV2(con *Connection, push *PushContext,
-	currentVersion string, w *WatchedResource, updates XdsUpdates) error {
-	// TODO: generators may send incremental changes if both sides agree on the protocol.
-	// This is specific to each generator type.
-	genRes := con.node.XdsResourceGenerator.Generate(con.node, push, w, updates)
-	if genRes.Data == nil {
+func (s *Server) pushGeneratorV2(con *Connection, push *PushContext, w *WatchedResource, updates XdsUpdates) error {
+	return s.pushXds(con.node.XdsResourceGenerator, con, push, w, updates)
+}
+
+func (s *Server) pushXds(gen XdsResourceGenerator, con *Connection, push *PushContext, w *WatchedResource, updates XdsUpdates) error {
+	genRes := gen.Generate(con.node, push, w, nil)
+	if len(genRes.Data) == 0 {
 		return nil // No push needed.
 	}
 
-	// TODO: add a 'version' to the result of generator. If set, use it to determine if the result
-	// changed - in many cases it will not change, so we can skip the push. Also the version will
-	// become dependent of the specific resource - for example in case of API it'll be the largest
-	// version of the requested type.
-
 	resp := &discovery.DiscoveryResponse{
-		TypeUrl:     w.TypeUrl,
-		VersionInfo: currentVersion,
-		Nonce:       nonce(push.Version),
+		ControlPlane: ControlPlane(),
+		TypeUrl:      w.TypeUrl,
+		VersionInfo:  genRes.Version,
 	}
 	if s.o.IncPush {
 		resp.Nonce = genRes.Version
+	} else {
+		resp.Nonce = nonce(genRes.Version)
 	}
 
 	if resp.Nonce == w.NonceSent {
@@ -191,21 +149,13 @@ func (s *Server) pushGeneratorV2(con *Connection, push *PushContext,
 		return nil
 	}
 
-	sz := 0
-	for _, rc := range genRes.Data {
-		resp.Resources = append(resp.Resources, rc)
-		sz += len(rc.Value)
-	}
-
 	err := con.send(resp)
 	if err != nil {
 		return err
 	}
 	w.LastSent = time.Now()
-	w.LastSize = sz // just resource size - doesn't include header and types
-	w.RecordNonceSent(resp.Nonce)
 
-	xdsLog.Infof("XDS: PUSH %s for node:%s resources:%d size %d nonce: %s", w.TypeUrl, con.node.ID, len(genRes.Data), sz, resp.Nonce)
+	xdsLog.Infof("XDS: PUSH %s for node:%s resources:%d size %d nonce: %s", w.TypeUrl, con.node.ID, len(genRes.Data), resp.Nonce)
 	return nil
 }
 

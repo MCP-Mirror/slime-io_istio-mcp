@@ -17,12 +17,13 @@ package xds
 import (
 	"strings"
 
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"istio.io/istio-mcp/pkg/config/schema/resource"
 	"istio.io/istio-mcp/pkg/features"
 	"istio.io/istio-mcp/pkg/model"
-	"istio.io/libistio/pkg/log"
+	"istio.io/libistio/pkg/util/sets"
 )
 
 // Experimental/WIP: this is not yet ready for production use.
@@ -53,10 +54,11 @@ type APIGenerator struct {
 //
 // Names are based on the current resource naming in istiod stores.
 func (g *APIGenerator) Generate(proxy *Proxy, push *PushContext, w *WatchedResource, updates XdsUpdates) Resources {
-	res := []*anypb.Any{}
+	res := []*discovery.Resource{}
 	var ver string
 	if g.incPush {
-		ver = w.NonceSent
+		// for incremental push, we also use the nonce store the lastest version.
+		ver = w.NonceAcked
 	}
 	newVer := ver
 
@@ -68,7 +70,7 @@ func (g *APIGenerator) Generate(proxy *Proxy, push *PushContext, w *WatchedResou
 	// We use: networking.istio.io/v1alpha3/EnvoyFilter
 	kind := strings.SplitN(w.TypeUrl, "/", 3)
 	if len(kind) != 3 {
-		log.Warnf("ADS: Unknown watched resources %s", w.TypeUrl)
+		xdsLog.Warnf("ADS: Unknown watched resources %s", w.TypeUrl)
 		// Still return an empty response - to not break waiting code. It is fine to not know about some resource.
 		return Resources{Version: newVer}
 	}
@@ -110,7 +112,7 @@ func (g *APIGenerator) Generate(proxy *Proxy, push *PushContext, w *WatchedResou
 
 	configs, listRev, err := push.ConfigStore.List(rgvk, "", ver)
 	if err != nil {
-		log.Warnf("ADS: Error reading resource %s %v", w.TypeUrl, err)
+		xdsLog.Warnf("ADS: Error reading resource %s %v", w.TypeUrl, err)
 		return Resources{Version: newVer}
 	}
 	if listRev > newVer {
@@ -121,7 +123,7 @@ func (g *APIGenerator) Generate(proxy *Proxy, push *PushContext, w *WatchedResou
 		for nn := range revChangedConfigNames {
 			cfg, err := push.ConfigStore.Get(rgvk, nn.Namespace, nn.Name)
 			if err != nil {
-				log.Warnf("ADS: Error get resource %s %v %v", w.TypeUrl, nn, err)
+				xdsLog.Warnf("ADS: Error get resource %s %v %v", w.TypeUrl, nn, err)
 				return Resources{Version: newVer}
 			}
 
@@ -173,16 +175,19 @@ func (g *APIGenerator) Generate(proxy *Proxy, push *PushContext, w *WatchedResou
 		// This also helps migrating MCP users.
 		b, err := model.PilotConfigToResource(&cfg)
 		if err != nil {
-			log.Warnf("ADS: Convert pilot config %v/%v to mcp resource error: %v", cfg.Namespace, cfg.Name, err)
+			xdsLog.Warnf("ADS: Convert pilot config %v/%v to mcp resource error: %v", cfg.Namespace, cfg.Name, err)
 			continue
 		}
 		any, err := anypb.New(b)
 		if err != nil {
 			// log.Warnf("ADS: Any error %v %v/%v", err, cfg.Namespace, cfg.Name)
-			log.Warnf("ADS: create any of %s error %v", b.String(), err)
+			xdsLog.Warnf("ADS: create any of %s error %v", b.String(), err)
 			continue
 		}
-		res = append(res, any)
+		res = append(res, &discovery.Resource{
+			Name:     b.Metadata.Name,
+			Resource: any,
+		})
 		w.RecordResourceSent(model.Key(&cfg))
 	}
 
@@ -192,6 +197,87 @@ func (g *APIGenerator) Generate(proxy *Proxy, push *PushContext, w *WatchedResou
 		Data:    res,
 		Version: newVer,
 	}
+}
+
+func (g *APIGenerator) GenerateDeltas(proxy *Proxy, push *PushContext, w *WatchedResource, updates XdsUpdates) (Resources, DeletedResources) {
+	gvk, ok := typeUrlToGvk(w.TypeUrl)
+	if !ok {
+		return Resources{}, DeletedResources{}
+	}
+	var err error
+	var configs, allDeltaConfigs []model.Config
+	var revmoved [][2]string // namespace,name
+	var newVer, lastVer string
+	lastVer = w.VersionAcked
+
+	allDeltaConfigs, newVer, err = push.List(gvk, "", lastVer)
+	if err != nil {
+		xdsLog.Warnf("ADS: Error reading resource %s %v", w.TypeUrl, err)
+		return Resources{
+			Version: lastVer,
+		}, DeletedResources{}
+	}
+	sub := sets.New(w.ResourceNames...)
+	if !w.Wildcard {
+		configs := []model.Config{}
+		for _, cfg := range allDeltaConfigs {
+			if sub.Contains(cfg.Namespace + "/" + cfg.Name) {
+				configs = append(configs, cfg)
+			}
+		}
+	} else {
+		configs = allDeltaConfigs
+	}
+	for k := range updates {
+		if k.Kind == gvk {
+			cfg, err := push.ConfigStore.Get(k.Kind, k.Namespace, k.Name)
+			resName := k.Namespace + "/" + k.Name
+			if !w.Wildcard && !sub.Contains(resName) {
+				continue
+			}
+			if err != nil || cfg == nil {
+				revmoved = append(revmoved, [2]string{k.Namespace, k.Name})
+			} else {
+				configs = append(configs, *cfg)
+			}
+		}
+	}
+
+	res := make([]*discovery.Resource, 0, len(configs))
+	for _, cfg := range configs {
+		// Right now model.Config is not a proto - until we change it, mcp.Resource.
+		// This also helps migrating MCP users.
+		b, err := model.PilotConfigToResource(&cfg)
+		if err != nil {
+			xdsLog.Warnf("ADS: Convert pilot config %v/%v to mcp resource error: %v", cfg.Namespace, cfg.Name, err)
+			continue
+		}
+		any, err := anypb.New(b)
+		if err != nil {
+			// log.Warnf("ADS: Any error %v %v/%v", err, cfg.Namespace, cfg.Name)
+			xdsLog.Warnf("ADS: create any of %s error %v", b.String(), err)
+			continue
+		}
+		res = append(res, &discovery.Resource{
+			Name:     b.Metadata.Name,
+			Resource: any,
+		})
+		w.RecordResourceSent(model.Key(&cfg))
+	}
+	delRes := make(DeletedResources, 0, len(revmoved))
+	for _, nsn := range revmoved {
+		delRes = append(delRes, nsn[0]+"/"+nsn[1])
+		w.RecordResourceSent(model.ConfigKey{
+			Kind:      gvk,
+			Namespace: nsn[0],
+			Name:      nsn[1],
+		})
+	}
+
+	return Resources{
+		Version: newVer,
+		Data:    res,
+	}, delRes
 }
 
 func proxyNeedsConfigs(proxy *Proxy, cfg model.Config) bool {

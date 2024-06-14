@@ -86,9 +86,7 @@ func TestServer(t *testing.T) {
 	}
 
 	c.Spec = &se
-	store.Update(ns, model.MakeSimpleConfigSnapshot("1", []model.Config{
-		c,
-	}))
+	store.Update(ns, model.MakeSimpleConfigSnapshot([]model.Config{c}))
 
 	// svr.NotifyPush()
 

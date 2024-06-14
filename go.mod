@@ -62,6 +62,4 @@ require (
 
 replace istio.io/libistio => github.com/slime-io/libistio v0.0.0-20240319025542-9b29030c6429
 
-// replace istio.io/libistio => ../libistio
-
 replace golang.org/x/exp => golang.org/x/exp v0.0.0-20230713183714-613f0c0eb8a1

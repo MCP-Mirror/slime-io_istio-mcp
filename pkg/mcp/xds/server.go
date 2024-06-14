@@ -10,9 +10,7 @@ import (
 
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
-	"google.golang.org/grpc/status"
 
 	"istio.io/istio-mcp/pkg/mcp"
 	"istio.io/istio-mcp/pkg/model"
@@ -118,10 +116,6 @@ func (s *Server) RegisterClientEventHandler(h func(mcp.ClientEvent)) {
 	s.clientEventHandlers = append(s.clientEventHandlers, h)
 }
 
-func (s *Server) DeltaAggregatedResources(server discovery.AggregatedDiscoveryService_DeltaAggregatedResourcesServer) error {
-	return status.Errorf(codes.Unimplemented, "not implemented")
-}
-
 func NewServer(o *ServerOptions) *Server {
 	ret := &Server{
 		o:           o,
@@ -213,4 +207,20 @@ func (s *Server) globalPushContext() *PushContext {
 	s.updateMutex.RLock()
 	defer s.updateMutex.RUnlock()
 	return s.pushContext
+}
+
+func (s *Server) findGenerator(typeUrl string, node *Proxy) XdsResourceGenerator {
+	// XdsResourceGenerator is the default generator for this connection. We want to allow
+	// some types to use custom generators - for example EDS.
+	g := node.XdsResourceGenerator
+	if cg, f := s.Generators[node.Metadata.Generator+"/"+typeUrl]; f {
+		g = cg
+	}
+	if cg, f := s.Generators[typeUrl]; f {
+		g = cg
+	}
+	if g == nil {
+		g = s.Generators["api"]
+	}
+	return g
 }
